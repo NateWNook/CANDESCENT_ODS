@@ -67,12 +67,18 @@ BEGIN
         EXEC xp_cmdshell @ps, no_output;
 
         -- 2) bcp the clean pipe file. -F 2 skips the ConvertTo-Csv header (which also carries the BOM).
-        --    Set-Content writes CRLF line endings -> -r"\r\n".
+        --    Row terminator is LF (-r"\n"): safe whether the clean file is LF or CRLF -- a CRLF file
+        --    just leaves a trailing CR on the last column, which the CHAR(13) strip below removes.
         DECLARE @cmd NVARCHAR(4000) =
             'bcp DBase_Nook.dbo.[ODS_CANDESCENT] in "' + @clean + '" ' +
-            '-c -t"|" -r"\r\n" -F 2 -C 65001 -m 100000 -T -S pdhasqlvip01 ' +
+            '-c -t"|" -r"\n" -F 2 -C 65001 -m 100000 -T -S pdhasqlvip01 ' +
             '-e "' + @err + '"';
         EXEC xp_cmdshell @cmd;
+
+        -- Strip any trailing carriage return left on the last column when the file is CRLF
+        UPDATE DBase_Nook.dbo.[ODS_CANDESCENT]
+        SET AccountEstmtEnableCodeDescription = REPLACE(AccountEstmtEnableCodeDescription, CHAR(13), '')
+        WHERE AccountEstmtEnableCodeDescription LIKE '%' + CHAR(13);
 
         -- Row count from the table (bcp runs out-of-process; @@ROWCOUNT won't reflect it)
         SET @rows    = (SELECT COUNT(*) FROM DBase_Nook.dbo.[ODS_CANDESCENT]);
