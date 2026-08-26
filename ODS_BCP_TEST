@@ -1,0 +1,5 @@
+-- 1) Run the PowerShell pre-clean WITH output visible (any PS error will show here)
+EXEC xp_cmdshell 'powershell -NoProfile -ExecutionPolicy Bypass -Command "$enc=New-Object System.Text.UTF8Encoding($false); $lines=Import-Csv ''\\pd100hubspt01.fcfcu.local\d$\Ancillary_Data_files\Candescent\Candescent-UserData.csv'' | ForEach-Object { ($_.PSObject.Properties.Value) -join ''|'' }; [System.IO.File]::WriteAllLines(''\\pd100hubspt01.fcfcu.local\d$\Ancillary_Data_files\Candescent\Candescent-clean.psv'',$lines,$enc)"';
+
+-- 2) Did the clean file get created? (look for Candescent-clean.psv with a non-zero size)
+EXEC xp_cmdshell 'dir "\\pd100hubspt01.fcfcu.local\d$\Ancillary_Data_files\Candescent"';
