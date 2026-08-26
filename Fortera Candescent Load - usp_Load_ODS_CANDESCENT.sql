@@ -62,7 +62,7 @@ BEGIN
             'powershell -NoProfile -ExecutionPolicy Bypass -Command "' +
             'Import-Csv ''' + @src + ''' -Encoding UTF8 | ' +
             'ConvertTo-Csv -NoTypeInformation -Delimiter ''|'' | ' +
-            'ForEach-Object { $_ -replace ''"'','''' } | ' +
+            'ForEach-Object { $_ -replace ([char]34),'''' } | ' +   -- [char]34 = " (avoids a literal quote that would unbalance cmd''s quoting)
             'Set-Content ''' + @clean + ''' -Encoding UTF8"';
         EXEC xp_cmdshell @ps, no_output;
 
