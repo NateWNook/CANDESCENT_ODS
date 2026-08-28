@@ -47,20 +47,60 @@ BEGIN
         TRUNCATE TABLE DBase_Nook.dbo.[ODS_CANDESCENT_STG];
 
         -- 2) quote-aware pre-clean (CLM-safe) -> pipe file
+        --    Import-Csv parses the source quote-aware; we then scrub each FIELD VALUE (strip '|',
+        --    CR, LF, TAB and '"') and re-join the values with '|'. Because the join is done per
+        --    OBJECT, every emitted row carries exactly 15 fields and contains no embedded row
+        --    terminator, so bcp can never over-read past the end of a row.
+        --
+        --    DO NOT revert to `ConvertTo-Csv | ForEach-Object { $_ -replace ([char]34),'' }`.
+        --    ConvertTo-Csv quotes any field holding a '|', '"' or newline; stripping every '"'
+        --    from the rendered LINE deletes exactly that protection, so those rows gain extra
+        --    fields or lose their row boundary and every value after the offending field shifts
+        --    left by one column. (The Velera loader hit this on 2026-08-27 -- there the last
+        --    column is an int, so bcp rejected the rows loudly with "Invalid character value for
+        --    cast specification". Here the last column is nvarchar(50), so a shifted row is only
+        --    rejected if it overflows a width or lands text in one of the int columns -- otherwise
+        --    it loads SILENTLY WRONG. Same bug, quieter symptom.)
+        --
+        --    The real header line is written first so bcp -F 2 skips it (and absorbs the UTF-8 BOM
+        --    that Set-Content -Encoding UTF8 emits on Windows PowerShell 5.1).
         DECLARE @ps NVARCHAR(4000) =
             'powershell -NoProfile -ExecutionPolicy Bypass -Command "' +
-            'Import-Csv ''' + @src + ''' -Encoding UTF8 | ' +
-            'ConvertTo-Csv -NoTypeInformation -Delimiter ''|'' | ' +
-            'ForEach-Object { $_ -replace ([char]34),'''' } | ' +
-            'Set-Content ''' + @clean + ''' -Encoding UTF8"';
+            '$q=[char]34; ' +
+            '$rows=Import-Csv ''' + @src + ''' -Encoding UTF8; ' +
+            'if($rows){ ' +
+              '($rows[0].PSObject.Properties.Name -join ''|'') | Set-Content ''' + @clean + ''' -Encoding UTF8; ' +
+              '$rows | ForEach-Object{ $r=$_; ' +
+                '($r.PSObject.Properties | ForEach-Object{ ($_.Value -replace ''[\r\n\t|]'','' '') -replace $q,'''' }) -join ''|'' ' +
+              '} | Add-Content ''' + @clean + ''' -Encoding UTF8 ' +
+            '}"';
         EXEC xp_cmdshell @ps, no_output;
 
-        --    bcp the clean pipe file INTO STAGING (-F 2 skips the ConvertTo-Csv header)
+        --    bcp the clean pipe file INTO STAGING (-F 2 skips the header row).
+        --    Capture bcp's stdout so a rejected-row run is surfaced instead of silently logging
+        --    'Success' after a short load.
         DECLARE @cmd NVARCHAR(4000) =
             'bcp DBase_Nook.dbo.[ODS_CANDESCENT_STG] in "' + @clean + '" ' +
             '-c -t"|" -r"\n" -F 2 -C 65001 -m 100000 -T -S pdhasqlvip01 ' +
             '-e "' + @err + '"';
-        EXEC xp_cmdshell @cmd;
+
+        IF OBJECT_ID('tempdb..#bcpout') IS NOT NULL DROP TABLE #bcpout;
+        CREATE TABLE #bcpout (seq int IDENTITY(1,1), line nvarchar(1000) NULL);
+        INSERT #bcpout (line) EXEC xp_cmdshell @cmd;
+
+        DECLARE @bcpmsg NVARCHAR(MAX) =
+            STUFF((SELECT CHAR(10) + line FROM #bcpout WHERE line IS NOT NULL ORDER BY seq
+                   FOR XML PATH(''), TYPE).value('.','nvarchar(max)'), 1, 1, '');
+
+        --    Data rows the pre-clean emitted (total lines minus the header). Compared with @staged
+        --    below: any shortfall means bcp rejected rows into CANDESCENT.err, and a rejected row
+        --    looks identical to "dropped from the file" to the SCD2 expire step -- it would be
+        --    flagged FLAG_DELETED='Y'. So a partial load must abort, not merge.
+        DECLARE @cntcmd NVARCHAR(4000) =
+            'powershell -NoProfile -Command "(Get-Content -LiteralPath ''' + @clean + ''' -ReadCount 0).Count - 1"';
+        DECLARE @cnt TABLE (line nvarchar(200) NULL);
+        INSERT @cnt EXEC xp_cmdshell @cntcmd;
+        DECLARE @fileRows INT = (SELECT MAX(TRY_CONVERT(int, line)) FROM @cnt);
 
         -- strip any trailing CR left on the last column when the file is CRLF
         UPDATE DBase_Nook.dbo.[ODS_CANDESCENT_STG]
@@ -79,6 +119,17 @@ BEGIN
         INTO #stg
         FROM DBase_Nook.dbo.[ODS_CANDESCENT_STG];
         SET @staged = @@ROWCOUNT;
+
+        -- Abort on a short load: merging a partial staging set would expire the rejected rows.
+        IF @staged = 0 OR (@fileRows IS NOT NULL AND @staged < @fileRows)
+        BEGIN
+            DECLARE @failmsg NVARCHAR(2048) = LEFT(CONCAT(
+                'bcp staged ', @staged, ' of ', ISNULL(CONVERT(varchar(20), @fileRows), '?'),
+                ' data rows from ', @clean, '. Rejected rows are logged in ', @err,
+                '. Aborting before the SCD2 merge so rejected rows are not expired as deleted.',
+                CHAR(10), 'bcp output: ', @bcpmsg), 2048);
+            THROW 50001, @failmsg, 1;
+        END
 
         DECLARE @now date = ISNULL((SELECT MAX(TRY_CONVERT(date, CAST(NULLIF(ProcessDate,0) AS char(8)),112)) FROM #stg),
                                    CAST(SYSDATETIME() AS date));
@@ -116,8 +167,9 @@ BEGIN
         COMMIT;
 
         SET @EndTime = SYSDATETIME();
-        SET @Message = CONCAT('Staged ', @staged, ' | new/changed versions inserted ', @inserted,
-                              ' | expired (dropped from file) ', @expired, '. Check CANDESCENT.err for rejects.');
+        SET @Message = CONCAT('Staged ', @staged, ' of ', ISNULL(CONVERT(varchar(20), @fileRows), '?'),
+                              ' file rows (0 rejected) | new/changed versions inserted ', @inserted,
+                              ' | expired (dropped from file) ', @expired, '.');
 
         UPDATE DBase_Nook.dbo.FlatFileLoadLog
         SET EndTime = @EndTime, Status = @Status, Message = @Message
